@@ -58,6 +58,7 @@ use std::sync::atomic::{
 use std::sync::{RwLock, Mutex};
 use std::ops;
 use into_ffi::IntoFfi;
+use error::{ErrorCode, ExternError};
 
 /// `HandleMap` is a collection type which can hold any type of value, and
 /// offers a stable handle which can be used to retrieve it on insertion. These
@@ -179,6 +180,12 @@ pub enum HandleError {
     /// attempted to be used with.
     #[fail(display = "Handle is from a different map")]
     WrongMap,
+}
+
+impl From<HandleError> for ExternError {
+    fn from(e: HandleError) -> Self {
+        ExternError::new_error(ErrorCode::INVALID_HANDLE, e.to_string())
+    }
 }
 
 impl<T> HandleMap<T> {
@@ -552,6 +559,62 @@ unsafe impl IntoFfi for Handle {
 /// that offers equivalent functionality.
 ///
 /// See the [module level documentation](index.html) for more info.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # #[macro_use] extern crate lazy_static;
+/// # extern crate ffi_support;
+/// # use ffi_support::*;
+/// # use std::sync::*;
+///
+/// // Somewhere...
+/// struct Thing { value: f64 }
+///
+/// lazy_static! {
+///     static ref ITEMS: ConcurrentHandleMap<Thing> = ConcurrentHandleMap::new();
+/// }
+///
+/// #[no_mangle]
+/// pub extern "C" fn mylib_new_thing(value: f64, err: &mut ExternError) -> u64 {
+///     // most of the time you'll actually want `call_with_result`, but we can't
+///     // fail to construct a `Thing`.
+///     call_with_output(err, || {
+///         ITEMS.insert(Thing { value })
+///     })
+/// }
+///
+/// #[no_mangle]
+/// pub extern "C" fn mylib_thing_value(h: u64, err: &mut ExternError) -> f64 {
+///     call_with_result(err, || {
+///         // XXX figure out how to better expose this error!
+///         // Note: the -> HandleError and etc are only required in this relatively simple
+///         // example due to the fact that the function cannot fail.
+///         ITEMS.get_u64(h, |val| -> Result<_, HandleError> {
+///             Ok(val.value)
+///         })
+///     })
+/// }
+///
+/// #[no_mangle]
+/// pub extern "C" fn mylib_thing_set_value(h: u64, new_value: f64, err: &mut ExternError) {
+///     call_with_result(err, || {
+///         // Note: the -> Result<_, HandleError> and etc are only required in this relatively simple
+///         // example due to the fact that the function cannot fail.
+///         ITEMS.get_mut_u64(h, |val| -> Result<_, HandleError> {
+///             val.value = new_value;
+///             Ok(())
+///         })
+///     })
+/// }
+///
+/// #[no_mangle]
+/// pub extern "C" fn mylib_destroy_thing(h: u64, err: &mut ExternError) {
+///     call_with_result(err, || {
+///         ITEMS.delete_u64(h)
+///     })
+/// }
+/// ```
 pub struct ConcurrentHandleMap<T> {
     pub map: RwLock<HandleMap<Mutex<T>>>,
 }
