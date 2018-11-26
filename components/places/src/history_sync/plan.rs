@@ -728,6 +728,9 @@ mod tests {
         let db = PlacesDb::open_in_memory(None)?;
         let outgoing = apply_plan(&db, result)?;
 
+        // Finish the plan to flush frecency changes / origins / etc.
+        finish_plan(&db)?;
+
         // should have applied it locally.
         let (page, visits) =
             fetch_visits(&db, &Url::parse("http://example.com").unwrap(), 2)?.expect("page exists");

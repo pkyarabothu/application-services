@@ -99,25 +99,36 @@ const CREATE_TABLE_ORIGINS_SQL: &str = "CREATE TABLE moz_origins (
         UNIQUE (prefix, host)
     )";
 
-const CREATE_TRIGGER_AFTER_INSERT_ON_PLACES: &str = "
-    CREATE TEMP TRIGGER moz_places_afterinsert_trigger
-    AFTER INSERT ON moz_places FOR EACH ROW
+// Note: Can't be combined with the next trigger, since we can't do an
+// `INSERT <blah blah> WHERE <blah>` here.
+const CREATE_TRIGGER_MOZPLACES_AFTERDELETE_TOMBSTONES: &str = "
+    CREATE TEMP TRIGGER moz_places_afterdelete_trigger_tombstones
+    AFTER DELETE ON moz_places
+    FOR EACH ROW WHEN OLD.sync_status == 2 -- 2 == SyncStatus::Normal
     BEGIN
-        INSERT OR IGNORE INTO moz_origins(prefix, host, rev_host, frecency)
-        VALUES(get_prefix(NEW.url), get_host_and_port(NEW.url), reverse_host(get_host_and_port(NEW.url)), NEW.frecency);
-
-        -- This is temporary.
-        UPDATE moz_places SET
-          origin_id = (SELECT id FROM moz_origins
-                       WHERE prefix = get_prefix(NEW.url) AND
-                             host = get_host_and_port(NEW.url) AND
-                             rev_host = reverse_host(get_host_and_port(NEW.url)))
-        WHERE id = NEW.id;
+        INSERT OR IGNORE INTO moz_places_tombstones (guid) VALUES (OLD.guid);
     END
 ";
 
 // Note that while we create tombstones manually, we rely on this trigger to
 // delete any which might exist when a new record is written to moz_places.
+const CREATE_TRIGGER_MOZPLACES_AFTERDELETE_ORIGINS: &str = "
+    CREATE TEMP TRIGGER moz_places_afterdelete_trigger_origins
+    AFTER DELETE ON moz_places
+    FOR EACH ROW
+    BEGIN
+        INSERT INTO moz_updateoriginsdelete_temp (prefix, host, frecency_delta)
+        VALUES (
+            get_prefix(OLD.url),
+            get_host_and_port(OLD.url),
+            -MAX(OLD.frecency, 0)
+        )
+        ON CONFLICT(prefix, host) DO UPDATE
+        SET frecency_delta = frecency_delta - OLD.frecency
+        WHERE OLD.frecency > 0;
+    END
+";
+
 const CREATE_TRIGGER_MOZPLACES_AFTERINSERT_REMOVE_TOMBSTONES: &str = "
     CREATE TEMP TRIGGER moz_places_afterinsert_trigger_tombstone
     AFTER INSERT ON moz_places
@@ -214,10 +225,209 @@ const CREATE_IDX_MOZ_BOOKMARKS_PLACELASTMODIFIED: &str =
 // const CREATE_IDX_MOZ_BOOKMARKS_DATEADDED: &str = "CREATE INDEX dateaddedindex ON moz_bookmarks(dateAdded)";
 // const CREATE_IDX_MOZ_BOOKMARKS_GUID: &str = "CREATE UNIQUE INDEX guid_uniqueindex ON moz_bookmarks(guid)";
 
-// Keys in the moz_meta table.
-// pub(crate) static MOZ_META_KEY_ORIGIN_FRECENCY_COUNT: &'static str = "origin_frecency_count";
-// pub(crate) static MOZ_META_KEY_ORIGIN_FRECENCY_SUM: &'static str = "origin_frecency_sum";
-// pub(crate) static MOZ_META_KEY_ORIGIN_FRECENCY_SUM_OF_SQUARES: &'static str = "origin_frecency_sum_of_squares";
+// This table is used, along with moz_places_afterinsert_trigger, to update
+// origins after places removals. During an INSERT into moz_places, origins are
+// accumulated in this table, then a DELETE FROM moz_updateoriginsinsert_temp
+// will take care of updating the moz_origins table for every new origin. See
+// CREATE_PLACES_AFTERINSERT_TRIGGER_ORIGINS below for details.
+const CREATE_UPDATEORIGINSINSERT_TEMP: &str = "
+    CREATE TEMP TABLE moz_updateoriginsinsert_temp (
+        place_id INTEGER PRIMARY KEY,
+        prefix TEXT NOT NULL,
+        host TEXT NOT NULL,
+        rev_host TEXT NOT NULL,
+        frecency INTEGER NOT NULL
+    )
+";
+
+// This table is used in a similar way to moz_updateoriginsinsert_temp, but for
+// deletes, and triggered via moz_places_afterdelete_trigger.
+//
+// When rows are added to this table, moz_places.origin_id may be null.  That's
+// why this table uses prefix + host as its primary key, not origin_id.
+const CREATE_UPDATEORIGINSDELETE_TEMP: &str = "
+    CREATE TEMP TABLE moz_updateoriginsdelete_temp (
+        prefix TEXT NOT NULL,
+        host TEXT NOT NULL,
+        frecency_delta INTEGER NOT NULL,
+        PRIMARY KEY (prefix, host)
+    ) WITHOUT ROWID
+";
+
+// This table is used in a similar way to moz_updateoriginsinsert_temp, but for
+// updates to places' frecencies, and triggered via
+// moz_places_afterupdate_frecency_trigger.
+//
+// When rows are added to this table, moz_places.origin_id may be null.  That's
+// why this table uses prefix + host as its primary key, not origin_id.
+const CREATE_UPDATEORIGINSUPDATE_TEMP: &str = "
+    CREATE TEMP TABLE moz_updateoriginsupdate_temp (
+        prefix TEXT NOT NULL,
+        host TEXT NOT NULL,
+        frecency_delta INTEGER NOT NULL,
+        PRIMARY KEY (prefix, host)
+    ) WITHOUT ROWID
+";
+
+// Note: desktop places also has a notion of "frecency decay", and it only runs this
+// `WHEN NOT is_frecency_decaying()`.
+const CREATE_PLACES_AFTERUPDATE_FRECENCY_TRIGGER: &str = "
+    CREATE TEMP TRIGGER moz_places_afterupdate_frecency_trigger
+    AFTER UPDATE OF frecency ON moz_places FOR EACH ROW
+    BEGIN
+
+        INSERT INTO moz_updateoriginsupdate_temp (prefix, host, frecency_delta)
+        VALUES (
+            get_prefix(NEW.url),
+            get_host_and_port(NEW.url),
+            MAX(NEW.frecency, 0) - MAX(OLD.frecency, 0)
+        )
+        ON CONFLICT(prefix, host) DO UPDATE
+        SET frecency_delta = frecency_delta + EXCLUDED.frecency_delta;
+    END
+";
+
+// Keys in the moz_meta table. Might be cool to replace this with an enum or something for better
+// type safety but whatever.
+pub(crate) static MOZ_META_KEY_ORIGIN_FRECENCY_COUNT: &'static str = "origin_frecency_count";
+pub(crate) static MOZ_META_KEY_ORIGIN_FRECENCY_SUM: &'static str = "origin_frecency_sum";
+pub(crate) static MOZ_META_KEY_ORIGIN_FRECENCY_SUM_OF_SQUARES: &'static str =
+    "origin_frecency_sum_of_squares";
+
+// This function is a helper for the next several triggers.  It updates the origin
+// frecency stats.  Use it as follows.  Before changing an origin's frecency,
+// call the function and pass "-" (subtraction) as the argument.  That will update
+// the stats by deducting the origin's current contribution to them.  And then
+// after you change the origin's frecency, call the function again, this time
+// passing "+" (addition) as the argument.  That will update the stats by adding
+// the origin's new contribution to them.
+fn update_origin_frecency_stats(op: &str) -> String {
+    format!(
+        "
+        INSERT OR REPLACE INTO moz_meta(key, value)
+        SELECT
+            '{frecency_count}',
+            IFNULL((SELECT value FROM moz_meta WHERE key = '{frecency_count}'), 0)
+                {op} CAST (frecency > 0 AS INT)
+        FROM moz_origins WHERE prefix = OLD.prefix AND host = OLD.host
+        UNION
+        SELECT
+            '{frecency_sum}',
+            IFNULL((SELECT value FROM moz_meta WHERE key = '{frecency_sum}'), 0)
+                {op} MAX(frecency, 0)
+        FROM moz_origins WHERE prefix = OLD.prefix AND host = OLD.host
+        UNION
+        SELECT
+            '{frecency_sum_of_squares}',
+            IFNULL((SELECT value FROM moz_meta WHERE key = '{frecency_sum_of_squares}'), 0)
+                {op} (MAX(frecency, 0) * MAX(frecency, 0))
+        FROM moz_origins WHERE prefix = OLD.prefix AND host = OLD.host
+    ",
+        op = op,
+        frecency_count = MOZ_META_KEY_ORIGIN_FRECENCY_COUNT,
+        frecency_sum = MOZ_META_KEY_ORIGIN_FRECENCY_SUM,
+        frecency_sum_of_squares = MOZ_META_KEY_ORIGIN_FRECENCY_SUM_OF_SQUARES,
+    )
+}
+
+// The next several triggers are a workaround for the lack of FOR EACH STATEMENT
+// in Sqlite, (see bug 871908).
+//
+// While doing inserts or deletes into moz_places, we accumulate the affected
+// origins into a temp table. Afterwards, we delete everything from the temp
+// table, causing the AFTER DELETE trigger to fire for it, which will then
+// update moz_origins and the origin frecency stats. As a consequence, we also
+// do this for updates to moz_places.frecency in order to make sure that changes
+// to origins are serialized.
+//
+// Note this way we lose atomicity, crashing between the 2 queries may break the
+// tables' coherency. So it's better to run those DELETE queries in a single
+// transaction. Regardless, this is still better than hanging the browser for
+// several minutes on a fast machine.
+
+// Note: unlike the version of this trigger in desktop places, we don't bother with calling
+// store_last_inserted_id. Bug comments indicate that's only really needed because the hybrid
+// sync/async connection places has prevents `last_insert_rowid` from working. This shouldn't be an
+// issue for us, and it's unclear how we'd implement `store_last_inserted_id` it while supporting
+// multiple connections to separate databases open simultaneously, which we'd like for testing
+// purposes. (To be clear, it's certainly possible to implement it if it turns out we need it, it
+// would just be very tricky).
+const CREATE_PLACES_AFTERINSERT_TRIGGER_ORIGINS: &str = "
+    CREATE TEMP TRIGGER moz_places_afterinsert_trigger_origins
+    AFTER INSERT ON moz_places FOR EACH ROW
+    BEGIN
+        INSERT OR IGNORE INTO moz_updateoriginsinsert_temp (place_id, prefix, host, rev_host, frecency)
+        VALUES (
+            NEW.id,
+            get_prefix(NEW.url),
+            get_host_and_port(NEW.url),
+            reverse_host(get_host_and_port(NEW.url)),
+            NEW.frecency
+        );
+    END
+";
+
+lazy_static! {
+    // This trigger corresponds to `CREATE_PLACES_AFTERINSERT_TRIGGER_ORIGINS`.  It runs on deletes on
+    // moz_updateoriginsinsert_temp -- logically, after inserts on moz_places.
+    static ref CREATE_UPDATEORIGINSINSERT_AFTERDELETE_TRIGGER: String = format!("
+        CREATE TEMP TRIGGER moz_updateoriginsinsert_afterdelete_trigger
+        AFTER DELETE ON moz_updateoriginsinsert_temp FOR EACH ROW
+        BEGIN
+            {decrease_frecency_stats};
+
+            INSERT INTO moz_origins (prefix, host, rev_host, frecency)
+            VALUES (
+                OLD.prefix,
+                OLD.host,
+                OLD.rev_host,
+                MAX(OLD.frecency, 0)
+            )
+            ON CONFLICT(prefix, host) DO UPDATE
+                SET frecency = frecency + OLD.frecency
+                WHERE OLD.frecency > 0;
+
+            {increase_frecency_stats};
+
+            UPDATE moz_places SET origin_id = (
+                SELECT id
+                FROM moz_origins
+                WHERE prefix = OLD.prefix
+                AND host = OLD.host
+            )
+            WHERE id = OLD.place_id;
+        END",
+        decrease_frecency_stats = update_origin_frecency_stats("-"),
+        increase_frecency_stats = update_origin_frecency_stats("+"),
+    );
+    // moz_updateoriginsdelete_temp -- logically, after deletes on moz_places.
+    static ref CREATE_UPDATEORIGINSDELETE_AFTERDELETE_TRIGGER: String = format!("
+        CREATE TEMP TRIGGER moz_updateoriginsdelete_afterdelete_trigger
+        AFTER DELETE ON moz_updateoriginsdelete_temp FOR EACH ROW
+        BEGIN
+            {decrease_frecency_stats};
+
+            UPDATE moz_origins SET frecency = frecency + OLD.frecency_delta
+            WHERE prefix = OLD.prefix AND host = OLD.host;
+
+            DELETE FROM moz_origins
+            WHERE prefix = OLD.prefix
+              AND host = OLD.host
+              AND NOT EXISTS (
+                SELECT id FROM moz_places
+                WHERE origin_id = moz_origins.id
+                LIMIT 1
+              );
+
+            {increase_frecency_stats};
+
+            -- Note: this is where desktop places deletes from moz_icons (so long as
+            -- the icon is no longer referenced)
+        END",
+        decrease_frecency_stats = update_origin_frecency_stats("-"),
+        increase_frecency_stats = update_origin_frecency_stats("+"),
+    );
+}
 
 pub fn init(db: &PlacesDb) -> Result<()> {
     let user_version = db.query_one::<i64>("PRAGMA user_version")?;
@@ -237,11 +447,20 @@ pub fn init(db: &PlacesDb) -> Result<()> {
     }
     log::debug!("Creating temp tables and triggers");
     db.execute_all(&[
-        CREATE_TRIGGER_AFTER_INSERT_ON_PLACES,
         &CREATE_TRIGGER_HISTORYVISITS_AFTERINSERT,
         &CREATE_TRIGGER_HISTORYVISITS_AFTERDELETE,
+        &CREATE_TRIGGER_MOZPLACES_AFTERDELETE_ORIGINS,
+        &CREATE_TRIGGER_MOZPLACES_AFTERDELETE_TOMBSTONES,
         CREATE_TRIGGER_MOZPLACES_AFTERINSERT_REMOVE_TOMBSTONES,
+        CREATE_UPDATEORIGINSINSERT_TEMP,
+        CREATE_UPDATEORIGINSDELETE_TEMP,
+        CREATE_UPDATEORIGINSUPDATE_TEMP,
+        CREATE_PLACES_AFTERUPDATE_FRECENCY_TRIGGER,
+        CREATE_PLACES_AFTERINSERT_TRIGGER_ORIGINS,
+        &*CREATE_UPDATEORIGINSINSERT_AFTERDELETE_TRIGGER,
+        &*CREATE_UPDATEORIGINSDELETE_AFTERDELETE_TRIGGER,
     ])?;
+
     Ok(())
 }
 

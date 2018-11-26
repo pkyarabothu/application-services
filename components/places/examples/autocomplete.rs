@@ -869,7 +869,7 @@ fn main() -> Result<()> {
         #[cfg(not(windows))]
         {
             // Can't use cfg! macro, this module doesn't exist at all on windows
-            autocomplete::start_autocomplete(Path::new(db_path).to_owned(), encryption_key)?;
+            autocomplete::start_autocomplete(Path::new(db_path).to_owned(), None)?;
         }
         #[cfg(windows)]
         {

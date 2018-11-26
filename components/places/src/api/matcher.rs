@@ -303,6 +303,24 @@ struct OriginOrUrl<'query, 'conn> {
     conn: &'conn PlacesDb,
 }
 
+const WITH_ORIGIN_AUTOFILL_THRESHOLD: &str = r#"
+    WITH frecency_stats(count, sum, squares) AS (
+        SELECT
+            IFNULL(CAST((SELECT value FROM moz_meta WHERE key = "origin_frecency_count") AS REAL), 0.0),
+            IFNULL(CAST((SELECT value FROM moz_meta WHERE key = "origin_frecency_sum") AS REAL), 0.0),
+            IFNULL(CAST((SELECT value FROM moz_meta WHERE key = "origin_frecency_sum_of_squares") AS REAL), 0.0)
+    ),
+    autofill_frecency_threshold(value) AS (
+        SELECT
+            CASE count
+                WHEN 0 THEN 0.0
+                WHEN 1 THEN sum
+                ELSE (sum / count) + (:stddevMultiplier * sqrt((squares - ((sum * sum) / count)) / count))
+            END
+        FROM frecency_stats
+    )
+"#;
+
 impl<'query, 'conn> OriginOrUrl<'query, 'conn> {
     pub fn new(query: &'query str, conn: &'conn PlacesDb) -> OriginOrUrl<'query, 'conn> {
         OriginOrUrl { query, conn }
@@ -312,9 +330,11 @@ impl<'query, 'conn> OriginOrUrl<'query, 'conn> {
 impl<'query, 'conn> Matcher for OriginOrUrl<'query, 'conn> {
     fn search(&self, _: u32) -> Result<Vec<SearchResult>> {
         let mut results = Vec::new();
+        // TODO: Find out if :stddevMultiplier/'origin_frecency_sum_of_squares' are worth keeping.
+        let stddev_multiplier = 0.0f64;
         if looks_like_origin(self.query) {
-            let mut stmt = self.conn.db.prepare(
-                "
+            let mut stmt = self.conn.db.prepare(&format!(
+                "{with_autofill_threshold}
                 SELECT IFNULL(:prefix, prefix) || moz_origins.host || '/' AS url,
                        moz_origins.host || '/' AS displayURL,
                        frecency,
@@ -329,7 +349,7 @@ impl<'query, 'conn> Matcher for OriginOrUrl<'query, 'conn> {
                   FROM moz_origins
                   WHERE host BETWEEN :searchString AND :searchString || X'FFFF'
                   GROUP BY host
-                  HAVING host_frecency >= :frecencyThreshold
+                  HAVING host_frecency >= (SELECT value FROM autofill_frecency_threshold)
                   UNION ALL
                   SELECT host,
                          TOTAL(frecency) AS host_frecency,
@@ -338,24 +358,26 @@ impl<'query, 'conn> Matcher for OriginOrUrl<'query, 'conn> {
                   FROM moz_origins
                   WHERE host BETWEEN 'www.' || :searchString AND 'www.' || :searchString || X'FFFF'
                   GROUP BY host
-                  HAVING host_frecency >= :frecencyThreshold
+                  HAVING host_frecency >= (SELECT value FROM autofill_frecency_threshold)
                 ) AS grouped_hosts
                 JOIN moz_origins ON moz_origins.host = grouped_hosts.host
                 ORDER BY frecency DESC, id DESC
                 LIMIT 1
             ",
-            )?;
+                with_autofill_threshold = WITH_ORIGIN_AUTOFILL_THRESHOLD
+            ))?;
             let params: &[(&str, &dyn rusqlite::types::ToSql)] = &[
                 (":prefix", &rusqlite::types::Null),
                 (":searchString", &self.query),
-                (":frecencyThreshold", &-1i64),
+                (":stddevMultiplier", &stddev_multiplier),
             ];
             for result in stmt.query_and_then_named(params, SearchResult::from_origin_row)? {
                 results.push(result?);
             }
         } else if self.query.contains(|c| c == '/' || c == ':' || c == '?') {
             let (host, remainder) = split_after_host_and_port(self.query);
-            let mut stmt = self.conn.db.prepare("
+            let mut stmt = self.conn.db.prepare(&format!(
+                "{with_autofill_threshold}
                 SELECT h.url as url,
                        :host || :remainder AS strippedURL,
                        h.frecency as frecency,
@@ -365,7 +387,7 @@ impl<'query, 'conn> Matcher for OriginOrUrl<'query, 'conn> {
                 FROM moz_places h
                 JOIN moz_origins o ON o.id = h.origin_id
                 WHERE o.rev_host = reverse_host(:host)
-                      AND MAX(h.frecency, 0) >= :frecencyThreshold
+                      AND MAX(h.frecency, 0) >= (SELECT value FROM autofill_frecency_threshold)
                       AND h.hidden = 0
                       AND strip_prefix_and_userinfo(h.url) BETWEEN strippedURL AND strippedURL || X'FFFF'
                 UNION ALL
@@ -378,17 +400,17 @@ impl<'query, 'conn> Matcher for OriginOrUrl<'query, 'conn> {
                 FROM moz_places h
                 JOIN moz_origins o ON o.id = h.origin_id
                 WHERE o.rev_host = reverse_host(:host) || 'www.'
-                      AND MAX(h.frecency, 0) >= :frecencyThreshold
+                      AND MAX(h.frecency, 0) >= (SELECT value FROM autofill_frecency_threshold)
                       AND h.hidden = 0
                       AND strip_prefix_and_userinfo(h.url) BETWEEN 'www.' || strippedURL AND 'www.' || strippedURL || X'FFFF'
                 ORDER BY h.frecency DESC, h.id DESC
                 LIMIT 1
-            ")?;
+            ", with_autofill_threshold = WITH_ORIGIN_AUTOFILL_THRESHOLD))?;
             let params: &[(&str, &dyn rusqlite::types::ToSql)] = &[
                 (":searchString", &self.query),
                 (":host", &host),
                 (":remainder", &remainder),
-                (":frecencyThreshold", &-1i64),
+                (":stddevMultiplier", &stddev_multiplier),
             ];
             for result in stmt.query_and_then_named(params, SearchResult::from_url_row)? {
                 results.push(result?);

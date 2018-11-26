@@ -223,6 +223,13 @@ pub fn apply_observation_direct(
             Some(visit_ob.get_redirect_frecency_boost()),
         )?;
     }
+
+    // Trigger insertions for all the new origins of the places we inserted.
+    db.execute("DELETE FROM moz_updateoriginsinsert_temp", NO_PARAMS)?;
+
+    // Trigger frecency updates for all those origins.
+    db.execute("DELETE FROM moz_updateoriginsupdate_temp", NO_PARAMS)?;
+
     Ok(visit_row_id)
 }
 
@@ -710,6 +717,12 @@ pub mod history_sync {
         db.conn()
             .execute_cached("DELETE from moz_places_tombstones", NO_PARAMS)?;
 
+        // Trigger insertions for all the new origins of the places we inserted.
+        db.conn()
+            .execute("DELETE FROM moz_updateoriginsinsert_temp", NO_PARAMS)?;
+        // Trigger frecency updates for all those origins.
+        db.conn()
+            .execute("DELETE FROM moz_updateoriginsupdate_temp", NO_PARAMS)?;
         Ok(())
     }
 
