@@ -17,20 +17,6 @@ fn parse_url(url: &str) -> sync15::Result<url::Url> {
     Ok(url::Url::parse(url)?)
 }
 
-fn logging_init() {
-    #[cfg(target_os = "android")]
-    {
-        android_logger::init_once(
-            android_logger::Filter::default().with_min_level(log::Level::Trace),
-            Some("libplaces_ffi"),
-        );
-        log::debug!("Android logging should be hooked up!")
-    }
-}
-
-// XXX I'm completely punting on error handling until we have time to refactor. I'd rather not
-// add more ffi error copypasta in the meantime.
-
 /// Instantiate a places connection. Returned connection must be freed with
 /// `places_connection_destroy`. Returns null and logs on errors (for now).
 #[no_mangle]
@@ -40,7 +26,6 @@ pub unsafe extern "C" fn places_connection_new(
     error: &mut ExternError,
 ) -> *mut PlacesDb {
     log::trace!("places_connection_new");
-    logging_init();
     call_with_result(error, || {
         let path = ffi_support::rust_string_from_c(db_path);
         let key = ffi_support::opt_rust_string_from_c(encryption_key);

@@ -9,24 +9,12 @@ use ffi_support::{
 use logins::{Login, PasswordEngine, Result};
 use std::os::raw::c_char;
 
-fn logging_init() {
-    #[cfg(target_os = "android")]
-    {
-        android_logger::init_once(
-            android_logger::Filter::default().with_min_level(log::Level::Trace),
-            Some("liblogins_ffi"),
-        );
-        log::debug!("Android logging should be hooked up!")
-    }
-}
-
 #[no_mangle]
 pub unsafe extern "C" fn sync15_passwords_state_new(
     db_path: *const c_char,
     encryption_key: *const c_char,
     error: &mut ExternError,
 ) -> *mut PasswordEngine {
-    logging_init();
     log::trace!("sync15_passwords_state_new");
     call_with_result(error, || {
         let path = rust_str_from_c(db_path);
