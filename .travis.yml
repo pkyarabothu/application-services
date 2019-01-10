@@ -14,14 +14,12 @@ before_deploy:
 jobs:
   include:
     - stage: Carthage framework GitHub Release
-      if: tag IS present
       language: rust
       rust: stable
       # We use OSX so that we can get a reasonably up to date version of SQLCipher.
       # (The version in Travis's default Ubuntu Trusty is much too old).
       os: osx
       osx_image: xcode10.1
-      if: tag IS present
       script: skip # Do not re-run tests
       deploy:
         provider: releases
